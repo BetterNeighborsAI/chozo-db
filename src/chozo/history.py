@@ -38,7 +38,7 @@ class FileHistoryStore:
         self.path.write_text(json.dumps(history, indent=2) + "\n")
 
 
-def _migrate_schema(history: dict) -> dict:
+def migrate_schema(history: dict) -> dict:
     """Normalize older flat histories into the v2 _meta + events[] shape."""
     if history.get("_meta", {}).get("schema_version") == HISTORY_SCHEMA_VERSION:
         return history
@@ -70,7 +70,7 @@ def _migrate_schema(history: dict) -> dict:
 
 
 def load(store: HistoryStore) -> dict:
-    return _migrate_schema(store.load())
+    return migrate_schema(store.load())
 
 
 def get_pending(env: str, history: dict, names: list[str]) -> list[str]:

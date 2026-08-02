@@ -4,6 +4,9 @@ A project is any directory tree containing a `chozo.toml` (resolved by walking
 up from the cwd, like git discovers `.git`). The config pins the migrations
 directory and the environment -> env-var mapping. With no config, chozo falls
 back to the default `local`/`dev`/`prod` -> `DATABASE_URL_*` convention.
+
+`read_project(root)` reads config for a known root (used by the registry);
+`load_config(start)` walks up from a directory to find the root first.
 """
 
 from __future__ import annotations
@@ -26,9 +29,15 @@ class ProjectConfig:
     name: str
     migrations_dir: Path
     envs: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ENVS))
+    # Registry layer fields (None/False => plain local project, no registry).
+    slug: str | None = None
+    registered: bool = False
+    history_override: Path | None = None
 
     @property
     def history_path(self) -> Path:
+        if self.history_override is not None:
+            return self.history_override
         return self.migrations_dir / "_history.json"
 
 
@@ -43,13 +52,9 @@ def find_project_root(start: Path | None = None) -> Path | None:
     return None
 
 
-def load_config(start: Path | None = None) -> ProjectConfig:
-    """Resolve the project config for the current working directory."""
-    root = find_project_root(start)
-    if root is None:
-        # Treat cwd as the root with default conventions.
-        root = Path.cwd().resolve()
-
+def read_project(root: Path) -> ProjectConfig:
+    """Read config for a known root. Falls back to defaults when no chozo.toml."""
+    root = root.expanduser().resolve()
     config_file = root / CONFIG_FILENAME
     envs = dict(DEFAULT_ENVS)
     if config_file.is_file():
@@ -63,8 +68,13 @@ def load_config(start: Path | None = None) -> ProjectConfig:
     else:
         name = root.name
         migrations_dir = (root / "migrations").resolve()
-
     return ProjectConfig(root=root, name=name, migrations_dir=migrations_dir, envs=envs)
+
+
+def load_config(start: Path | None = None) -> ProjectConfig:
+    """Resolve the project config for a directory (walks up to find the root)."""
+    root = find_project_root(start) or Path.cwd().resolve()
+    return read_project(root)
 
 
 def require_env_url(envs: dict[str, str], env: str) -> str:

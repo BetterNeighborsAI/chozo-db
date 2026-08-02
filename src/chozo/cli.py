@@ -16,9 +16,10 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatch
+from pathlib import Path
 
-from chozo import config, discovery, history, migrator
-from chozo.constants import APP_NAME, EXIT_FAIL, EXIT_NOTHING_TO_DO, EXIT_OK
+from chozo import config, discovery, history, migrator, registry
+from chozo.constants import APP_NAME, APP_TAGLINE, EXIT_FAIL, EXIT_NOTHING_TO_DO, EXIT_OK
 from chozo.discovery import Migration
 from chozo.history import FileHistoryStore
 from chozo.output import Output
@@ -28,8 +29,18 @@ _NAME_SANITIZE = re.compile(r"[^a-z0-9_]+")
 
 @dataclass
 class Ctx:
-    cfg: config.ProjectConfig
+    """Runtime context. `cfg` resolves the active project lazily, so registry-only
+    commands (register/projects/use/...) never trigger project resolution."""
+
     out: Output
+    resolver: Callable[[], config.ProjectConfig]
+    _cfg: config.ProjectConfig | None = None
+
+    @property
+    def cfg(self) -> config.ProjectConfig:
+        if self._cfg is None:
+            self._cfg = self.resolver()
+        return self._cfg
 
 
 def _store(ctx: Ctx) -> FileHistoryStore:
@@ -57,14 +68,15 @@ def _prod_gate(env: str, dry_run: bool, confirm_prod: bool, out: Output) -> bool
 
 
 def cmd_init(args: argparse.Namespace, ctx: Ctx) -> int:
-    cfg = ctx.cfg
-    config_file = cfg.root / "chozo.toml"
+    # init creates a *new* project in the cwd, independent of registry resolution.
+    root = Path.cwd().resolve()
+    config_file = root / "chozo.toml"
     if config_file.exists() and not args.force:
         ctx.out.error(f"{config_file} already exists (use --force to overwrite).")
         return EXIT_FAIL
-    migrations_dir = cfg.root / (args.migrations_dir or "migrations")
+    migrations_dir = root / (args.migrations_dir or "migrations")
     migrations_dir.mkdir(parents=True, exist_ok=True)
-    name = args.name or cfg.root.name
+    name = args.name or root.name
     config_file.write_text(
         f'''[project]
 name = "{name}"
@@ -80,9 +92,10 @@ url_var = "DATABASE_URL_DEV"
 url_var = "DATABASE_URL"
 '''
     )
-    ctx.out.success(f"Initialized chozo project '{name}' at {cfg.root}")
+    ctx.out.success(f"Initialized chozo project '{name}' at {root}")
     ctx.out.note(f"Migrations dir: {migrations_dir}")
     ctx.out.note("Set DATABASE_URL_LOCAL / _DEV / or DATABASE_URL to connect.")
+    ctx.out.note("Run `chozo register` to add this project to the ~/.chozo registry.")
     return EXIT_OK
 
 
@@ -449,6 +462,94 @@ def config_target(url: str) -> str:
     return format_target(url)
 
 
+# --- registry commands (operate on the registry itself; no project resolution) ---
+
+
+def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
+    root = Path(args.path).expanduser() if args.path else Path.cwd()
+    try:
+        result = registry.register(root, name=args.name, slug=args.slug)
+    except FileNotFoundError as exc:
+        ctx.out.error(str(exc))
+        return EXIT_FAIL
+    if args.json:
+        ctx.out.emit_json({"status": "registered", **result})
+        return EXIT_OK
+    ctx.out.success(f"Registered project '{result['name']}' as slug '{result['slug']}'")
+    ctx.out.note(f"Root: {result['root']}")
+    if result["history_migrated"]:
+        ctx.out.note("Migrated existing local history into the registry (archived migrations/_history.json).")
+    return EXIT_OK
+
+
+def cmd_unregister(args: argparse.Namespace, ctx: Ctx) -> int:
+    if (
+        not args.yes
+        and not ctx.out.quiet
+        and not ctx.out.confirm(
+            f"Unregister '{args.slug}' and delete its registry history? Source files are never touched.", default=False
+        )
+    ):
+        ctx.out.info("Aborted.")
+        return EXIT_FAIL
+    if not registry.unregister(args.slug):
+        ctx.out.error(f"unknown project slug '{args.slug}'.")
+        return EXIT_FAIL
+    if args.json:
+        ctx.out.emit_json({"status": "unregistered", "slug": args.slug})
+        return EXIT_OK
+    ctx.out.success(f"Unregistered '{args.slug}' (registry entry + history removed; source untouched).")
+    return EXIT_OK
+
+
+def cmd_projects(args: argparse.Namespace, ctx: Ctx) -> int:
+    rows = registry.list_projects()
+    if args.json:
+        ctx.out.emit_json({"projects": rows})
+        return EXIT_OK
+    if not rows:
+        ctx.out.info("No projects registered. Run `chozo register` inside a project to add it.")
+        return EXIT_OK
+    for row in rows:
+        marker = "*" if row["current"] else " "
+        state = "" if row["exists"] else "  [missing root]"
+        ctx.out.note(f"{marker} {row['slug']:<24} {row['name'] or '':<20} {row['root']}{state}")
+    return EXIT_OK
+
+
+def cmd_use(args: argparse.Namespace, ctx: Ctx) -> int:
+    if not registry.set_current(args.slug):
+        ctx.out.error(f"unknown project slug '{args.slug}'.")
+        return EXIT_FAIL
+    if args.json:
+        ctx.out.emit_json({"status": "current", "slug": args.slug})
+        return EXIT_OK
+    ctx.out.success(f"Current project set to '{args.slug}'.")
+    return EXIT_OK
+
+
+def cmd_which(args: argparse.Namespace, ctx: Ctx) -> int:
+    cfg = ctx.cfg  # resolves the active project
+    payload = {
+        "slug": cfg.slug,
+        "name": cfg.name,
+        "root": str(cfg.root),
+        "registered": cfg.registered,
+        "migrations_dir": str(cfg.migrations_dir),
+        "history_path": str(cfg.history_path),
+        "envs": cfg.envs,
+    }
+    if args.json:
+        ctx.out.emit_json(payload)
+        return EXIT_OK
+    scope = f"registered (slug '{cfg.slug}')" if cfg.registered else "local (unregistered)"
+    ctx.out.note(f"Project: {cfg.name}  [{scope}]")
+    ctx.out.note(f"Root: {cfg.root}")
+    ctx.out.note(f"Migrations: {cfg.migrations_dir}")
+    ctx.out.note(f"History: {cfg.history_path}")
+    return EXIT_OK
+
+
 # --- parser ---
 
 
@@ -463,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--json", action="store_true", dest="json_out", help="Emit JSON to stdout (agent mode).")
+    p.add_argument(
+        "--project",
+        metavar="SLUG",
+        help="Project slug from the ~/.chozo registry. Overrides cwd/current resolution (agents use this).",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("init", help="Create chozo.toml + migrations dir.")
@@ -517,6 +623,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--confirm-prod", action="store_true", help="Consent flag required for --env prod.")
     sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
+    sp = sub.add_parser("register", help="Register the current project in the ~/.chozo registry.")
+    sp.add_argument("--path", help="Project root to register (defaults to cwd).")
+    sp.add_argument("--name", help="Project name (defaults to chozo.toml name or dir name).")
+    sp.add_argument("--slug", help="Override the generated slug.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
+    sp = sub.add_parser("unregister", help="Remove a project from the registry (never touches source).")
+    sp.add_argument("slug", help="Project slug to remove.")
+    sp.add_argument("--yes", "-y", action="store_true", help="No confirmation prompt.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
+    sp = sub.add_parser("projects", help="List registered projects.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
+    sp = sub.add_parser("use", help="Set the current project (default when cwd matches nothing).")
+    sp.add_argument("slug", help="Project slug to make current.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
+    sp = sub.add_parser("which", help="Show the active project chozo resolved.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
     return p
 
 
@@ -532,15 +659,28 @@ _HANDLERS = {
     "history": cmd_history,
     "inspect": cmd_inspect,
     "run": cmd_run,
+    "register": cmd_register,
+    "unregister": cmd_unregister,
+    "projects": cmd_projects,
+    "use": cmd_use,
+    "which": cmd_which,
 }
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     out = Output(quiet=bool(args.json_out or getattr(args, "json", False)))
-    ctx = Ctx(cfg=config.load_config(), out=out)
 
-    out.banner(ctx.cfg.name)
+    def resolver() -> config.ProjectConfig:
+        try:
+            return registry.resolve(explicit_slug=args.project)
+        except (KeyError, FileNotFoundError) as exc:
+            out.error(str(exc))
+            sys.exit(EXIT_FAIL)
+
+    ctx = Ctx(out=out, resolver=resolver)
+
+    out.banner(APP_TAGLINE)
     fn = _HANDLERS.get(args.command)
     if fn is None:
         out.error(f"unknown command: {args.command}")

@@ -6,7 +6,7 @@ Agent-friendly PostgreSQL migrations + schema inspection CLI. Named after the Ch
 
 ## Status
 
-**In progress.** Engine port first; autogenerate and the multi-project registry land next.
+**In progress.** Engine + multi-project registry shipped; autogenerate lands next.
 
 ## Install
 
@@ -80,12 +80,45 @@ url_var = "DATABASE_URL"
 
 Without a `chozo.toml`, `chozo` falls back to `local`/`dev`/`prod` reading `DATABASE_URL_LOCAL`/`DATABASE_URL_DEV`/`DATABASE_URL`.
 
+## Multi-project registry (`~/.chozo`)
+
+`chozo` can manage many projects on one machine, with history and credentials isolated per project. Registering a project moves its history into the machine registry (source files are never touched).
+
+```bash
+chozo register                          # register the current project
+chozo register --path ~/work/api        # register another directory
+chozo projects                          # list registered projects
+chozo use api                           # set a default for outside any project
+chozo which                             # show the project chozo resolved
+chozo unregister api                    # remove from registry (source untouched)
+```
+
+Layout:
+
+```
+~/.chozo/
+  registry.json                # index: slug -> {name, root, ...}, plus "current"
+  projects/
+    <slug>/
+      project.json             # registered metadata
+      history.json             # that project's migration history (v2)
+```
+
+**Isolation is structural.** Every command resolves exactly one project and reads only that project's history, env mapping, and migrations dir. Nothing crosses projects. Resolution order (first hit wins):
+
+1. `--project <slug>` — explicit, what agents should use
+2. cwd matches a registered root (longest match, like git discovers `.git`)
+3. the `current` marker (set by `chozo use <slug>`)
+4. a local, unregistered project (its own `chozo.toml` / defaults, history in `migrations/_history.json`)
+
+Set `CHOZO_HOME` to relocate the registry (used by tests).
+
 ## Roadmap
 
 - [x] Engine: run / rollback / status / mark / unmark / dry-run / `--json` / destructive detection
-- [ ] `chozo inspect` — reflect live schema as JSON
+- [x] `chozo inspect` — reflect live schema as JSON
+- [x] `~/.chozo` multi-project registry with per-project history + credential isolation
 - [ ] `chozo analyze` / `chozo diff` — Alembic-style autogenerate from SQLAlchemy/SQLModel models
-- [ ] `~/.chozo` multi-project registry with per-project history + credential isolation
 
 ## Development
 
