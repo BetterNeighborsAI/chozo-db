@@ -1,0 +1,76 @@
+[project]
+name = "chozo-db"
+version = "0.1.0"
+description = "Agent-friendly PostgreSQL migrations + schema inspection. The Chozo guard the knowledge."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [{ name = "Better Neighbors AI" }]
+keywords = ["database", "migrations", "postgres", "cli", "sql", "agents", "alembic"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Environment :: Console",
+    "Topic :: Database",
+]
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.3.3",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+term = ["simple-term-menu>=1.6.6"]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+    "pyright>=1.1.411",
+]
+
+[project.scripts]
+chozo = "chozo.cli:main"
+chozo-db = "chozo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/BetterNeighborsAI/chozo-db"
+Repository = "https://github.com/BetterNeighborsAI/chozo-db"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chozo"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long (formatter handles)
+    "SIM102", # nested ifs are clearer in CLI menu logic
+    "SIM108", # ternary suggestions often reduce readability
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["chozo"]
+
+[tool.ruff.format]
+# drop-in black-compatible
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+include = ["src/chozo", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "dbtest: integration test needing a real Postgres (TEST_DATABASE_URL); skipped otherwise",
+]
