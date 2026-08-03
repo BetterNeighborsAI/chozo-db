@@ -8,12 +8,16 @@ APP_TAGLINE = "guardian of knowledge"
 # Active history schema. v2 adds `_meta` and a per-migration `events[]` trail.
 HISTORY_SCHEMA_VERSION = 2
 HISTORY_FILENAME = "_history.json"
+LEGACY_HISTORY_FILENAME = "migration_history.json"
 
 # Per-project config file, discovered by walking up from the working directory.
 CONFIG_FILENAME = "chozo.toml"
 
-# A migration is a directory named `NNN_<snake>` containing `up.sql` + `down.sql`.
+# Native migrations are directories named `NNN_<snake>` containing `up.sql` +
+# `down.sql`.  Flat `NNN_*.sql` files are also supported as one-way migrations
+# for compatibility with migracli and existing SQL migration repositories.
 MIGRATION_NAME_RE = r"^\d{3}_[a-z0-9_]+$"
+LEGACY_MIGRATION_NAME_RE = r"^\d{3}_.*\.sql$"
 UP_FILENAME = "up.sql"
 DOWN_FILENAME = "down.sql"
 

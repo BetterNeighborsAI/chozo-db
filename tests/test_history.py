@@ -57,6 +57,19 @@ def test_remove(tmp_path: Path) -> None:
     assert history.remove(store, hist, "dev", "001_add_users") is False
 
 
+def test_rollback_keeps_event_trail_and_marks_pending(tmp_path: Path) -> None:
+    store, _ = _store(tmp_path)
+    hist = history.load(store)
+    history.record(store, hist, "dev", "001_add_users", method="executed")
+
+    history.record_rollback(store, hist, "dev", "001_add_users", duration_seconds=0.2)
+
+    entry = hist["dev"]["001_add_users"]
+    assert entry["applied_at"] is None
+    assert [event["action"] for event in entry["events"]] == ["executed", "rolled_back"]
+    assert history.get_pending("dev", hist, ["001_add_users"]) == ["001_add_users"]
+
+
 def test_schema_v1_migrated_to_v2(tmp_path: Path) -> None:
     path = tmp_path / "history.json"
     path.write_text(json.dumps({"dev": {"001_x": {"applied_at": "2025-01-01T00:00:00", "method": "executed"}}}))
@@ -101,3 +114,31 @@ def test_merge_histories_unions_and_dedups(tmp_path: Path) -> None:
     merged = history.merge_histories(local, remote)
     assert set(merged["dev"]) == {"001_a", "002_b"}
     assert len(merged["dev"]["001_a"]["events"]) == 1  # deduped by (at, action)
+
+
+def test_merge_uses_latest_rollback_state() -> None:
+    applied = {
+        "applied_at": "2026-01-01T00:00:00+00:00",
+        "applied_by": "tester",
+        "method": "executed",
+        "duration_seconds": 0.1,
+        "events": [{"at": "2026-01-01T00:00:00+00:00", "action": "executed"}],
+    }
+    rolled_back = {
+        "applied_at": None,
+        "applied_by": None,
+        "method": None,
+        "duration_seconds": None,
+        "events": [
+            {"at": "2026-01-01T00:00:00+00:00", "action": "executed"},
+            {"at": "2026-01-02T00:00:00+00:00", "action": "rolled_back"},
+        ],
+    }
+
+    merged = history.merge_histories(
+        {"_meta": {"schema_version": 2}, "dev": {"001_a": rolled_back}},
+        {"_meta": {"schema_version": 2}, "dev": {"001_a": applied}},
+    )
+
+    assert merged["dev"]["001_a"]["applied_at"] is None
+    assert len(merged["dev"]["001_a"]["events"]) == 2

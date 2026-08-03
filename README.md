@@ -6,7 +6,9 @@ Agent-friendly PostgreSQL migrations + schema inspection CLI. Named after the Ch
 
 ## Status
 
-**In progress.** Engine + multi-project registry shipped; autogenerate lands next.
+**In progress.** The migracli runner surface and multi-project registry are
+available, including legacy flat-file compatibility and optional GCS history
+sync. ORM-aware autogeneration lands next.
 
 ## Install
 
@@ -35,8 +37,9 @@ Every destructive or state-changing path is non-interactive when given the flags
 
 ```bash
 chozo run all --env dev --json                          # apply pending, print JSON
-chozo run 003_*.sql --env dev --dry-run --json          # ROLLBACK, no history
+chozo run '003_*' --env dev --dry-run --json             # ROLLBACK, no history
 chozo run all --env prod --confirm-prod --yes --json    # prod needs explicit consent
+chozo run all --env local --history-env dev --no-record-history --json  # disposable clone
 ```
 
 Exit codes: `0` success · `1` failure · `2` nothing to do.
@@ -47,7 +50,7 @@ Exit codes: `0` success · `1` failure · `2` nothing to do.
 
 ## Migrations
 
-Each migration lives in its own directory with an UP and a DOWN file:
+Native Chozo migrations live in directories with UP and DOWN files:
 
 ```
 migrations/
@@ -60,6 +63,15 @@ migrations/
 ```
 
 The runner owns transactions: it strips standalone `BEGIN/COMMIT/ROLLBACK` and wraps each migration in a single transaction, so every migration uses one code path.
+
+Existing migracli-style `NNN_description.sql` files are discovered alongside
+native migrations. They are treated as one-way migrations because they do not
+have a `down.sql`; applying, status, marking, history, dry-run, and glob
+selection all work without converting the repository. If an existing
+`migration_history.json` is present, Chozo reuses it rather than creating a
+separate `_history.json`. With no `chozo.toml`, the migracli
+`sql/migrations/` layout is discovered automatically when walking up from the
+current directory.
 
 ## Configuration
 
@@ -113,9 +125,27 @@ Layout:
 
 Set `CHOZO_HOME` to relocate the registry (used by tests).
 
+## Shared history sync
+
+Chozo retains migracli's optional GCS state synchronization. Install the extra
+and set the same environment variables:
+
+```bash
+uv tool install 'chozo-db[gcs]'
+export GCS_MIGRATIONS_BUCKET=my-bucket
+export GCS_MIGRATIONS_PATH=migrations/migration_history.json  # optional default
+chozo sync --json
+```
+
+When configured, history is merged from GCS on load and pushed after local
+saves. A cloud outage never discards a successful local history write. For
+multiple registered projects, give each project a distinct
+`GCS_MIGRATIONS_PATH`.
+
 ## Roadmap
 
 - [x] Engine: run / rollback / status / mark / unmark / dry-run / `--json` / destructive detection
+- [x] Migracli compatibility: flat SQL files / GCS sync / clone history mode
 - [x] `chozo inspect` — reflect live schema as JSON
 - [x] `~/.chozo` multi-project registry with per-project history + credential isolation
 - [ ] `chozo analyze` / `chozo diff` — Alembic-style autogenerate from SQLAlchemy/SQLModel models

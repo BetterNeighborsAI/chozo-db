@@ -46,3 +46,34 @@ def test_require_env_url_reads_env_var(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL_DEV", "postgresql://u:p@localhost/db")
     cfg = config.load_config()
     assert config.require_env_url(cfg.envs, "dev") == "postgresql://u:p@localhost/db"
+
+
+def test_existing_migracli_history_file_is_reused(tmp_path: Path) -> None:
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    legacy = migrations / "migration_history.json"
+    legacy.write_text("{}\n")
+
+    assert config.read_project(tmp_path).history_path == legacy
+
+
+def test_native_history_takes_precedence_when_both_exist(tmp_path: Path) -> None:
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "migration_history.json").write_text("{}\n")
+    native = migrations / "_history.json"
+    native.write_text("{}\n")
+
+    assert config.read_project(tmp_path).history_path == native
+
+
+def test_zero_config_discovers_migracli_sql_layout(tmp_path: Path) -> None:
+    migrations = tmp_path / "sql" / "migrations"
+    migrations.mkdir(parents=True)
+    nested = tmp_path / "scripts" / "migrations"
+    nested.mkdir(parents=True)
+
+    cfg = config.load_config(nested)
+
+    assert cfg.root == tmp_path.resolve()
+    assert cfg.migrations_dir == migrations.resolve()

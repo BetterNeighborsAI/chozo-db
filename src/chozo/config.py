@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from chozo.constants import CONFIG_FILENAME, DEFAULT_ENVS
+from chozo.constants import CONFIG_FILENAME, DEFAULT_ENVS, HISTORY_FILENAME, LEGACY_HISTORY_FILENAME
 
 try:
     import tomllib  # py311+
@@ -38,15 +38,26 @@ class ProjectConfig:
     def history_path(self) -> Path:
         if self.history_override is not None:
             return self.history_override
-        return self.migrations_dir / "_history.json"
+        native = self.migrations_dir / HISTORY_FILENAME
+        legacy = self.migrations_dir / LEGACY_HISTORY_FILENAME
+        # Existing migracli repositories keep their applied state in
+        # migration_history.json. Prefer Chozo's filename once it exists.
+        return legacy if legacy.exists() and not native.exists() else native
 
 
 def find_project_root(start: Path | None = None) -> Path | None:
-    """Walk up from `start` (default cwd) looking for a chozo.toml or migrations dir."""
+    """Walk up looking for config, native migrations, or migracli's layout."""
     here = (start or Path.cwd()).resolve()
-    for candidate in [here, *here.parents]:
+    candidates = [here, *here.parents]
+    for candidate in candidates:
         if (candidate / CONFIG_FILENAME).is_file():
             return candidate
+    # Check the distinctive migracli layout before a generic directory named
+    # "migrations" (e.g. backend/scripts/migrations) can become a false root.
+    for candidate in candidates:
+        if (candidate / "sql" / "migrations").is_dir():
+            return candidate
+    for candidate in candidates:
         if (candidate / "migrations").is_dir():
             return candidate
     return None
@@ -67,7 +78,8 @@ def read_project(root: Path) -> ProjectConfig:
                 envs[env_name] = env_cfg["url_var"]
     else:
         name = root.name
-        migrations_dir = (root / "migrations").resolve()
+        legacy_dir = root / "sql" / "migrations"
+        migrations_dir = (legacy_dir if legacy_dir.is_dir() else root / "migrations").resolve()
     return ProjectConfig(root=root, name=name, migrations_dir=migrations_dir, envs=envs)
 
 

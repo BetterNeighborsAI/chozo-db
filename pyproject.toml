@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 term = ["simple-term-menu>=1.6.6"]
+gcs = ["google-cloud-storage>=2.18.0"]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.6.0",

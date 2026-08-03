@@ -8,6 +8,7 @@ flags, never by relying on a prompt.
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 
@@ -126,6 +127,34 @@ class Output:
             return default or ""
         result = Prompt.ask(msg, default=default, console=self.console)
         return result if result is not None else (default or "")
+
+    def select(self, title: str, options: list[str], default_index: int = 0) -> int | None:
+        """Select one option with arrow keys when available, else by number."""
+        if self.quiet or not options or not self.console.is_terminal:
+            return None
+        try:
+            menu_module = importlib.import_module("simple_term_menu")
+            menu = menu_module.TerminalMenu(
+                options,
+                title=title,
+                cursor_index=max(0, min(default_index, len(options) - 1)),
+                clear_screen=False,
+                cycle_cursor=True,
+            )
+            selected = menu.show()
+            return selected if isinstance(selected, int) else None
+        except (ImportError, ModuleNotFoundError):
+            self.console.print(f"[bold]{title}[/bold]")
+            for index, option in enumerate(options, 1):
+                self.console.print(f"  [cyan]{index}[/cyan]  {option}")
+            choices = [str(index) for index in range(1, len(options) + 1)] + ["q"]
+            selected = Prompt.ask(
+                "Choose",
+                choices=choices,
+                default=str(max(0, min(default_index, len(options) - 1)) + 1),
+                console=self.console,
+            )
+            return None if selected == "q" else int(selected) - 1
 
     def emit_json(self, data: dict) -> None:
         print(json.dumps(data, indent=2))

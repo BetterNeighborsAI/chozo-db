@@ -63,6 +63,22 @@ def test_register_migrates_local_history_into_registry(home: Path, tmp_path: Pat
     assert "001_x" in merged["dev"]
 
 
+def test_register_migrates_migracli_history_into_registry(home: Path, tmp_path: Path) -> None:
+    root = _make_project(tmp_path, "legacy-app")
+    local_history = root / "migrations" / "migration_history.json"
+    local_history.write_text(
+        json.dumps({"dev": {"001_x.sql": {"applied_at": "2025-01-01T00:00:00", "method": "executed"}}})
+    )
+
+    result = registry.register(root)
+
+    assert result["history_migrated"] is True
+    assert not local_history.exists()
+    assert (root / "migrations" / "migration_history.json.archived").exists()
+    merged = FileHistoryStore(registry.project_history_path("legacy-app")).load()
+    assert "001_x.sql" in merged["dev"]
+
+
 def test_resolve_by_cwd_match(home: Path, tmp_path: Path) -> None:
     root = _make_project(tmp_path, "my-app")
     registry.register(root)

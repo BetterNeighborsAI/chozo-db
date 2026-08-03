@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
-from chozo import config, discovery, history, migrator, registry
+from chozo import config, discovery, history, integrity, migrator, registry, sync
 from chozo.constants import APP_NAME, APP_TAGLINE, EXIT_FAIL, EXIT_NOTHING_TO_DO, EXIT_OK
 from chozo.discovery import Migration
-from chozo.history import FileHistoryStore
+from chozo.history import FileHistoryStore, HistoryStore
 from chozo.output import Output
 
 _NAME_SANITIZE = re.compile(r"[^a-z0-9_]+")
@@ -43,8 +43,16 @@ class Ctx:
         return self._cfg
 
 
-def _store(ctx: Ctx) -> FileHistoryStore:
+def _local_store(ctx: Ctx) -> FileHistoryStore:
     return FileHistoryStore(ctx.cfg.history_path)
+
+
+def _store(ctx: Ctx) -> HistoryStore:
+    local = _local_store(ctx)
+    remote = sync.gcs_remote_from_env()
+    if remote is None:
+        return local
+    return sync.SyncedHistoryStore(local, remote, warn=ctx.out.warning)
 
 
 def _env_url(ctx: Ctx, env: str) -> str:
@@ -96,6 +104,15 @@ url_var = "DATABASE_URL"
     ctx.out.note(f"Migrations dir: {migrations_dir}")
     ctx.out.note("Set DATABASE_URL_LOCAL / _DEV / or DATABASE_URL to connect.")
     ctx.out.note("Run `chozo register` to add this project to the ~/.chozo registry.")
+    if args.json:
+        ctx.out.emit_json(
+            {
+                "status": "initialized",
+                "name": name,
+                "root": str(root),
+                "migrations_dir": str(migrations_dir),
+            }
+        )
     return EXIT_OK
 
 
@@ -118,6 +135,15 @@ def cmd_new(args: argparse.Namespace, ctx: Ctx) -> int:
     ctx.out.success(f"Created {name}/")
     ctx.out.note(str(mig_dir / "up.sql"))
     ctx.out.note(str(mig_dir / "down.sql"))
+    if args.json:
+        ctx.out.emit_json(
+            {
+                "status": "created",
+                "migration": name,
+                "up": str(mig_dir / "up.sql"),
+                "down": str(mig_dir / "down.sql"),
+            }
+        )
     return EXIT_OK
 
 
@@ -151,11 +177,15 @@ def _run_up(
     ctx: Ctx,
     env: str,
     *,
-    selector: Callable[[], list[Migration] | None],
+    selector: Callable[[dict], list[Migration] | None],
     dry_run: bool,
     yes: bool,
     confirm_prod: bool,
     json_out: bool,
+    history_env: str | None = None,
+    record_history: bool = True,
+    target: str | None = None,
+    allow_rerun: bool = False,
 ) -> int:
     cfg = ctx.cfg
     url = _env_url(ctx, env)
@@ -163,16 +193,34 @@ def _run_up(
 
     store = _store(ctx)
     hist = history.load(store)
-    _ = hist  # selector reads history fresh; keep load to surface corrupt-file errors early.
-
-    targets = selector()
-    if targets is None or not targets:
+    history_key = history_env or env
+    targets = selector(hist)
+    if targets is None:
+        message = f"No migration matches '{target}'" if target else "Migration selector matched nothing."
+        ctx.out.error(message)
+        if json_out:
+            ctx.out.emit_json(
+                {
+                    "status": "failed",
+                    "env": env,
+                    "history_env": history_key,
+                    "record_history": record_history,
+                    "dry_run": dry_run,
+                    "migrations": [],
+                    "error": message,
+                    "summary": {"applied": 0, "failed": 0, "skipped": 0},
+                }
+            )
+        return EXIT_FAIL
+    if not targets:
         ctx.out.info(f"No pending migrations for {env}.")
         if json_out:
             ctx.out.emit_json(
                 {
                     "status": "success",
                     "env": env,
+                    "history_env": history_key,
+                    "record_history": record_history,
                     "dry_run": dry_run,
                     "migrations": [],
                     "summary": {"applied": 0, "failed": 0, "skipped": 0},
@@ -181,6 +229,19 @@ def _run_up(
         return EXIT_NOTHING_TO_DO
 
     if not _prod_gate(env, dry_run, confirm_prod, ctx.out):
+        if json_out:
+            ctx.out.emit_json(
+                {
+                    "status": "failed",
+                    "env": env,
+                    "history_env": history_key,
+                    "record_history": record_history,
+                    "dry_run": dry_run,
+                    "migrations": [],
+                    "error": "prod requires --confirm-prod",
+                    "summary": {"applied": 0, "failed": 0, "skipped": 0},
+                }
+            )
         return EXIT_FAIL
 
     if not yes and not ctx.out.quiet:
@@ -189,7 +250,20 @@ def _run_up(
             ctx.out.info("Aborted.")
             return EXIT_FAIL
 
-    return _execute_up(ctx, env, url, hist, store, targets, dry_run=dry_run, json_out=json_out)
+    return _execute_up(
+        ctx,
+        env,
+        url,
+        hist,
+        store,
+        targets,
+        dry_run=dry_run,
+        json_out=json_out,
+        history_env=history_key,
+        record_history=record_history,
+        yes=yes,
+        allow_rerun=allow_rerun,
+    )
 
 
 def _execute_up(
@@ -197,24 +271,64 @@ def _execute_up(
     env: str,
     url: str,
     hist: dict,
-    store: FileHistoryStore,
+    store: HistoryStore,
     targets: list[Migration],
     *,
     dry_run: bool,
     json_out: bool,
+    history_env: str,
+    record_history: bool,
+    yes: bool,
+    allow_rerun: bool,
 ) -> int:
     results: list[dict] = []
     applied = failed = skipped = 0
     for mig in targets:
+        digest = integrity.content_hash(mig)
+        # Rename detection: identical content already applied under a different
+        # name (e.g. a renamed one-off data upload). Never silently re-run it.
+        if not dry_run:
+            dup = integrity.find_duplicate(digest, hist, history_env, mig.name)
+            if dup is not None and not allow_rerun:
+                old, at = dup["name"], dup["applied_at"]
+                if yes or ctx.out.quiet:
+                    skipped += 1
+                    entry = {
+                        "file": mig.name,
+                        "result": "blocked",
+                        "elapsed_s": 0,
+                        "error": f"identical content already applied as '{old}' on {at}; pass --allow-rerun to force",
+                    }
+                    results.append(entry)
+                    ctx.out.warning(
+                        f"Blocked {mig.name}: identical content already applied as '{old}' (pass --allow-rerun to force)."
+                    )
+                    continue
+                if not ctx.out.confirm(
+                    f"'{mig.name}' has identical content to already-applied '{old}' (applied {at}). Run again as '{mig.name}'?",
+                    default=False,
+                ):
+                    skipped += 1
+                    results.append({"file": mig.name, "result": "skipped", "elapsed_s": 0})
+                    ctx.out.info(f"Skipped {mig.name}")
+                    continue
         res = migrator.execute(url, mig, dry_run=dry_run)
-        entry: dict = {
+        entry = {
             "file": mig.name,
             "result": res.status,
             "elapsed_s": round(res.duration, 3) if res.duration else 0,
         }
         if res.status == "applied":
-            if not dry_run:
-                history.record(store, hist, env, mig.name, method="executed", duration_seconds=res.duration)
+            if not dry_run and record_history:
+                history.record(
+                    store,
+                    hist,
+                    history_env,
+                    mig.name,
+                    method="executed",
+                    duration_seconds=res.duration,
+                    content_hash=digest,
+                )
             applied += 1
             ctx.out.success(f"Applied {mig.name}" + (f" [{res.duration:.2f}s]" if res.duration else ""))
         elif res.status == "blocked":
@@ -224,11 +338,11 @@ def _execute_up(
         else:
             failed += 1
             entry["error"] = res.error
-            if not dry_run:
+            if not dry_run and record_history:
                 history.record(
                     store,
                     hist,
-                    env,
+                    history_env,
                     mig.name,
                     method="executed",
                     duration_seconds=res.duration,
@@ -247,6 +361,8 @@ def _execute_up(
             {
                 "status": "failed" if failed else "success",
                 "env": env,
+                "history_env": history_env,
+                "record_history": record_history,
                 "dry_run": dry_run,
                 "migrations": results,
                 "summary": {"applied": applied, "failed": failed, "skipped": skipped},
@@ -260,9 +376,7 @@ def cmd_up(args: argparse.Namespace, ctx: Ctx) -> int:
         ctx.out.error("--env is required (set in chozo.toml [envs]).")
         return EXIT_FAIL
 
-    def selector() -> list[Migration] | None:
-        store = _store(ctx)
-        hist = history.load(store)
+    def selector(hist: dict) -> list[Migration] | None:
         all_migs = discovery.discover(ctx.cfg.migrations_dir)
         names = [m.name for m in all_migs]
         pending_names = history.get_pending(args.env, hist, names)
@@ -276,17 +390,27 @@ def cmd_up(args: argparse.Namespace, ctx: Ctx) -> int:
         yes=args.yes,
         confirm_prod=args.confirm_prod,
         json_out=args.json,
+        allow_rerun=args.allow_rerun,
     )
 
 
 def cmd_run(args: argparse.Namespace, ctx: Ctx) -> int:
-    def selector() -> list[Migration] | None:
-        store = _store(ctx)
-        hist = history.load(store)
+    history_key = args.history_env or args.env
+
+    def selector(hist: dict) -> list[Migration] | None:
         all_migs = discovery.discover(ctx.cfg.migrations_dir)
         names = [m.name for m in all_migs]
-        pending_names = history.get_pending(args.env, hist, names)
-        return _select_up_targets(all_migs, pending_names, target=args.target, to=None)
+        pending_names = history.get_pending(history_key, hist, names)
+        if args.target == "all":
+            return _select_up_targets(all_migs, pending_names, target="all", to=None)
+        matches = [m for m in all_migs if fnmatch(m.name, args.target)]
+        if not matches:
+            return None
+        if args.dry_run:
+            # Match migracli: a targeted dry-run may re-run an applied migration.
+            return matches
+        pending_set = set(pending_names)
+        return [m for m in matches if m.name in pending_set]
 
     return _run_up(
         ctx,
@@ -296,6 +420,10 @@ def cmd_run(args: argparse.Namespace, ctx: Ctx) -> int:
         yes=True,
         confirm_prod=args.confirm_prod,
         json_out=args.json,
+        history_env=history_key,
+        record_history=not args.no_record_history,
+        target=args.target,
+        allow_rerun=args.allow_rerun,
     )
 
 
@@ -330,6 +458,17 @@ def cmd_down(args: argparse.Namespace, ctx: Ctx) -> int:
         return EXIT_NOTHING_TO_DO
 
     if not _prod_gate(args.env, args.dry_run, args.confirm_prod, ctx.out):
+        if args.json:
+            ctx.out.emit_json(
+                {
+                    "status": "failed",
+                    "env": args.env,
+                    "dry_run": args.dry_run,
+                    "migrations": [],
+                    "error": "prod requires --confirm-prod",
+                    "summary": {"rolled_back": 0, "failed": 0},
+                }
+            )
         return EXIT_FAIL
 
     if not args.yes and not ctx.out.quiet:
@@ -346,8 +485,7 @@ def cmd_down(args: argparse.Namespace, ctx: Ctx) -> int:
         entry = {"file": mig.name, "result": res.status, "elapsed_s": round(res.duration, 3) if res.duration else 0}
         if res.status == "applied":
             if not args.dry_run:
-                history.record(store, hist, args.env, mig.name, method="rolled_back", duration_seconds=res.duration)
-                history.remove(store, hist, args.env, mig.name)
+                history.record_rollback(store, hist, args.env, mig.name, duration_seconds=res.duration)
             rolled_back += 1
             ctx.out.success(f"Rolled back {mig.name}")
         else:
@@ -382,10 +520,23 @@ def cmd_status(args: argparse.Namespace, ctx: Ctx) -> int:
     names = [m.name for m in all_migs]
     pending = history.get_pending(args.env, hist, names)
     applied = hist.get(args.env, {})
+    # Drift: applied migrations whose on-disk content no longer matches the
+    # hash recorded when they were applied.
+    by_name = {m.name: m for m in all_migs}
+    drift = [
+        name
+        for name in names
+        if name not in pending
+        and integrity.find_drift(by_name[name], integrity.content_hash(by_name[name]), hist, args.env)
+    ]
     if args.json:
-        ctx.out.emit_json({"env": args.env, "applied": [n for n in names if n not in pending], "pending": pending})
+        ctx.out.emit_json(
+            {"env": args.env, "applied": [n for n in names if n not in pending], "pending": pending, "drift": drift}
+        )
         return EXIT_OK
     ctx.out.status_tree(args.env, names, applied, pending)
+    for name in drift:
+        ctx.out.warning(f"{name}: content changed since it was applied.")
     ctx.out.note(f"Total {len(names)}  Applied {len(names) - len(pending)}  Pending {len(pending)}")
     return EXIT_OK
 
@@ -394,11 +545,14 @@ def cmd_mark(args: argparse.Namespace, ctx: Ctx) -> int:
     store = _store(ctx)
     hist = history.load(store)
     all_migs = discovery.discover(ctx.cfg.migrations_dir)
+    by_name = {m.name: m for m in all_migs}
     names = [m.name for m in all_migs]
     pending = history.get_pending(args.env, hist, names)
     targets = [n for n in pending if fnmatch(n, args.pattern or "*")] if args.pattern else pending
     if not targets:
         ctx.out.success(f"No pending migrations to mark for {args.env}.")
+        if args.json:
+            ctx.out.emit_json({"status": "success", "env": args.env, "marked": []})
         return EXIT_OK
     if (
         not args.yes
@@ -408,9 +562,11 @@ def cmd_mark(args: argparse.Namespace, ctx: Ctx) -> int:
         ctx.out.info("Aborted.")
         return EXIT_FAIL
     for name in targets:
-        history.record(store, hist, args.env, name, method="marked")
+        history.record(store, hist, args.env, name, method="marked", content_hash=integrity.content_hash(by_name[name]))
         ctx.out.success(f"Marked {name}")
     ctx.out.summary(len(targets), len(targets), args.env, verb="marked")
+    if args.json:
+        ctx.out.emit_json({"status": "success", "env": args.env, "marked": targets})
     return EXIT_OK
 
 
@@ -419,8 +575,12 @@ def cmd_unmark(args: argparse.Namespace, ctx: Ctx) -> int:
     hist = history.load(store)
     if not history.remove(store, hist, args.env, args.name):
         ctx.out.warning(f"{args.name} not found in {args.env} history.")
+        if args.json:
+            ctx.out.emit_json({"status": "success", "env": args.env, "unmarked": [], "not_found": args.name})
         return EXIT_OK
     ctx.out.success(f"Removed {args.name} from {args.env} history.")
+    if args.json:
+        ctx.out.emit_json({"status": "success", "env": args.env, "unmarked": [args.name]})
     return EXIT_OK
 
 
@@ -453,6 +613,27 @@ def cmd_inspect(args: argparse.Namespace, ctx: Ctx) -> int:
     url = _env_url(ctx, args.env)
     schema = migrator.reflect(url)
     ctx.out.emit_json({"env": args.env, "schema": schema})
+    return EXIT_OK
+
+
+def cmd_sync(args: argparse.Namespace, ctx: Ctx) -> int:
+    remote = sync.gcs_remote_from_env()
+    if remote is None:
+        message = f"GCS sync is not configured; set {sync.GCS_BUCKET_ENV}."
+        ctx.out.warning(message)
+        if args.json:
+            ctx.out.emit_json({"status": "not_configured", "error": message})
+        return EXIT_NOTHING_TO_DO
+    result = sync.synchronize(_local_store(ctx), remote)
+    payload = {
+        "status": "synced",
+        "remote_found": result.remote_found,
+        "last_synced_at": result.history.get("_meta", {}).get("last_synced_at"),
+    }
+    if args.json:
+        ctx.out.emit_json(payload)
+    else:
+        ctx.out.success("Migration history synchronized with GCS.")
     return EXIT_OK
 
 
@@ -575,9 +756,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", help="Project name (defaults to directory name).")
     sp.add_argument("--migrations-dir", default="migrations", help="Migrations directory (relative to project root).")
     sp.add_argument("--force", action="store_true", help="Overwrite an existing chozo.toml.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("new", help="Create a new migration (UP + DOWN).")
     sp.add_argument("name", help="Snake_case migration name, e.g. add_users_table.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("up", help="Apply pending migrations.")
     _add_env(sp)
@@ -585,6 +768,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", "-y", action="store_true", help="No confirmation prompt.")
     sp.add_argument("--dry-run", action="store_true", help="Execute then ROLLBACK; record nothing.")
     sp.add_argument("--confirm-prod", action="store_true", help="Consent flag required for --env prod.")
+    sp.add_argument(
+        "--allow-rerun",
+        action="store_true",
+        help="Allow re-running content already applied under a different name (e.g. a renamed one-off).",
+    )
     sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("down", aliases=["rollback"], help="Roll back applied migrations (DOWN).")
@@ -603,10 +791,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env(sp, required=True)
     sp.add_argument("pattern", nargs="?", default="*", help="Glob, e.g. '003_*' or '*'.")
     sp.add_argument("--yes", "-y", action="store_true", help="No confirmation prompt.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("unmark", help="Remove a migration from history.")
     sp.add_argument("name", help="Migration directory name.")
     _add_env(sp, required=True)
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("history", help="Show the event trail for an environment.")
     _add_env(sp, required=True)
@@ -616,11 +806,31 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env(sp, required=True)
     sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout (default for inspect).")
 
+    sp = sub.add_parser("sync", help="Merge local migration history with the configured GCS state.")
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
     sp = sub.add_parser("run", help="Non-interactive apply for agents/CI.")
     sp.add_argument("target", help="'all', a glob, or a migration name.")
     _add_env(sp, required=True)
     sp.add_argument("--dry-run", action="store_true", help="Execute then ROLLBACK; record nothing.")
     sp.add_argument("--confirm-prod", action="store_true", help="Consent flag required for --env prod.")
+    sp.add_argument(
+        "--yes", "-y", action="store_true", help="Accepted for migracli compatibility; run is non-interactive."
+    )
+    sp.add_argument(
+        "--history-env",
+        help="Use another environment's history for pending checks (requires --no-record-history).",
+    )
+    sp.add_argument(
+        "--no-record-history",
+        action="store_true",
+        help="Execute without writing migration history (useful for disposable clones).",
+    )
+    sp.add_argument(
+        "--allow-rerun",
+        action="store_true",
+        help="Allow re-running content already applied under a different name (e.g. a renamed one-off).",
+    )
     sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("register", help="Register the current project in the ~/.chozo registry.")
@@ -658,6 +868,7 @@ _HANDLERS = {
     "unmark": cmd_unmark,
     "history": cmd_history,
     "inspect": cmd_inspect,
+    "sync": cmd_sync,
     "run": cmd_run,
     "register": cmd_register,
     "unregister": cmd_unregister,
@@ -668,8 +879,12 @@ _HANDLERS = {
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    out = Output(quiet=bool(args.json_out or getattr(args, "json", False)))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.json = bool(args.json_out or getattr(args, "json", False))
+    if args.command == "run" and args.history_env and not args.no_record_history:
+        parser.error("run --history-env requires --no-record-history to avoid mutating another environment's history.")
+    out = Output(quiet=args.json)
 
     def resolver() -> config.ProjectConfig:
         try:

@@ -1,7 +1,7 @@
 """Migration history.
 
 A history file is a JSON document with a `_meta` block and per-env entries.
-Each entry keeps top-level applied pointer plusthe full `events[]` trail (every
+Each entry keeps a top-level applied pointer plus the full `events[]` trail (every
 attempt, success or failure, with actor + duration + error). The store is a
 simple file path today; a `~/.chozo` registry can swap this out later without
 touching the engine.
@@ -92,6 +92,7 @@ def record(
     duration_seconds: float | None = None,
     success: bool = True,
     error: str | None = None,
+    content_hash: str | None = None,
 ) -> None:
     if env not in history:
         history[env] = {}
@@ -114,6 +115,7 @@ def record(
             "applied_by": None,
             "method": None,
             "duration_seconds": None,
+            "content_hash": None,
             "events": [],
         }
         history[env][name] = entry
@@ -123,6 +125,44 @@ def record(
         entry["applied_by"] = user
         entry["method"] = method
         entry["duration_seconds"] = duration_seconds
+        if content_hash is not None:
+            entry["content_hash"] = content_hash
+    store.save(history)
+
+
+def record_rollback(
+    store: HistoryStore,
+    history: dict,
+    env: str,
+    name: str,
+    duration_seconds: float | None = None,
+) -> None:
+    """Record a successful DOWN while retaining the migration's audit trail."""
+    if env not in history:
+        history[env] = {}
+    entry = history[env].setdefault(
+        name,
+        {
+            "applied_at": None,
+            "applied_by": None,
+            "method": None,
+            "duration_seconds": None,
+            "events": [],
+        },
+    )
+    entry["events"].append(
+        {
+            "action": "rolled_back",
+            "at": datetime.now(UTC).isoformat(),
+            "by": getpass.getuser(),
+            "duration_seconds": duration_seconds,
+            "success": True,
+        }
+    )
+    entry["applied_at"] = None
+    entry["applied_by"] = None
+    entry["method"] = None
+    entry["duration_seconds"] = None
     store.save(history)
 
 
@@ -136,7 +176,7 @@ def remove(store: HistoryStore, history: dict, env: str, name: str) -> bool:
 
 
 def merge_histories(local: dict, remote: dict) -> dict:
-    """Union two histories, dedup events by (at, action), newer applied_at wins."""
+    """Union histories, dedup events, and take state from the latest event."""
     merged: dict = {"_meta": local.get("_meta", {}).copy()}
     all_envs = {k for k in [*local.keys(), *remote.keys()] if k != "_meta"}
     for env in all_envs:
@@ -160,8 +200,8 @@ def merge_histories(local: dict, remote: dict) -> dict:
                         seen.add(key)
                         all_events.append(ev)
                 all_events.sort(key=lambda e: e.get("at") or "")
-                l_at = l_entry.get("applied_at") or ""
-                r_at = r_entry.get("applied_at") or ""
+                l_at = max([l_entry.get("applied_at") or "", *(ev.get("at") or "" for ev in l_entry.get("events", []))])
+                r_at = max([r_entry.get("applied_at") or "", *(ev.get("at") or "" for ev in r_entry.get("events", []))])
                 winner = r_entry if r_at > l_at else l_entry
                 merged_env[filename] = {
                     "applied_at": winner.get("applied_at"),

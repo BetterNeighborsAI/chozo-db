@@ -165,14 +165,14 @@ def _write_project_json(slug: str, entry: dict) -> None:
 
 
 def _migrate_local_history(cfg: config.ProjectConfig, slug: str) -> bool:
-    local_path = cfg.migrations_dir / "_history.json"
+    local_path = cfg.history_path
     if not local_path.exists():
         return False
     local = json.loads(local_path.read_text())
     registry_store = FileHistoryStore(project_history_path(slug))
     merged = history.merge_histories(history.load(registry_store), history.migrate_schema(local))
     registry_store.save(merged)
-    local_path.rename(cfg.migrations_dir / "_history.json.archived")
+    local_path.rename(local_path.with_name(f"{local_path.name}.archived"))
     return True
 
 
