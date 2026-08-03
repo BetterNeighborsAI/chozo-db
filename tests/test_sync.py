@@ -95,3 +95,63 @@ def test_gcs_remote_from_env(monkeypatch) -> None:
     assert remote is not None
     assert remote.bucket == "bucket"
     assert remote.path == "custom/history.json"
+
+
+# --- remote resolution from project config ---
+
+from chozo.config import ProjectConfig, SyncConfig  # noqa: E402
+
+
+def _cfg(tmp_path: Path, sync_cfg: SyncConfig | None = None, slug: str | None = None, name: str = "my-app"):
+    return ProjectConfig(
+        root=tmp_path,
+        name=name,
+        migrations_dir=tmp_path / "migrations",
+        sync=sync_cfg or SyncConfig(),
+        slug=slug,
+    )
+
+
+def test_remote_from_config_prefers_env_vars(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GCS_MIGRATIONS_BUCKET", "env-bucket")
+    monkeypatch.setenv("GCS_MIGRATIONS_PATH", "env/path.json")
+    remote = sync.remote_from_config(_cfg(tmp_path, SyncConfig(bucket="toml-bucket")))
+    assert remote is not None
+    assert remote.bucket == "env-bucket"
+    assert remote.path == "env/path.json"
+
+
+def test_remote_from_config_defaults_path_per_project_slug(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GCS_MIGRATIONS_BUCKET", raising=False)
+    monkeypatch.delenv("GCS_MIGRATIONS_PATH", raising=False)
+    remote = sync.remote_from_config(_cfg(tmp_path, SyncConfig(bucket="chozo-migrations"), slug="pd-intelligence"))
+    assert remote is not None
+    assert remote.bucket == "chozo-migrations"
+    assert remote.path == "pd-intelligence/history.json"
+
+
+def test_remote_from_config_slugifies_name_without_registry_slug(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GCS_MIGRATIONS_BUCKET", raising=False)
+    monkeypatch.delenv("GCS_MIGRATIONS_PATH", raising=False)
+    remote = sync.remote_from_config(_cfg(tmp_path, SyncConfig(bucket="chozo-migrations"), name="My App"))
+    assert remote is not None
+    assert remote.path == "my-app/history.json"
+
+
+def test_remote_from_config_explicit_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GCS_MIGRATIONS_BUCKET", raising=False)
+    monkeypatch.delenv("GCS_MIGRATIONS_PATH", raising=False)
+    remote = sync.remote_from_config(_cfg(tmp_path, SyncConfig(bucket="b", path="custom/state.json"), slug="s"))
+    assert remote is not None
+    assert remote.path == "custom/state.json"
+
+
+def test_remote_from_config_unconfigured(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GCS_MIGRATIONS_BUCKET", raising=False)
+    monkeypatch.delenv("GCS_MIGRATIONS_PATH", raising=False)
+    assert sync.remote_from_config(_cfg(tmp_path)) is None
+
+
+def test_remote_uri(tmp_path: Path) -> None:
+    remote = sync.GCSHistoryRemote("chozo-migrations", "pd-intelligence/history.json")
+    assert sync.remote_uri(remote) == "gs://chozo-migrations/pd-intelligence/history.json"

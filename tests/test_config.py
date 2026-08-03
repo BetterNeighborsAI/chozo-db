@@ -77,3 +77,46 @@ def test_zero_config_discovers_migracli_sql_layout(tmp_path: Path) -> None:
 
     assert cfg.root == tmp_path.resolve()
     assert cfg.migrations_dir == migrations.resolve()
+
+
+def test_toml_parses_sync_section(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "chozo.toml").write_text(
+        """[project]
+name = "my-app"
+
+[sync]
+bucket = "chozo-migrations"
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    cfg = config.load_config()
+    assert cfg.sync.bucket == "chozo-migrations"
+    assert cfg.sync.path is None
+    assert cfg.sync_slug == "my-app"
+
+
+def test_toml_sync_explicit_path(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "chozo.toml").write_text(
+        """[project]
+name = "my-app"
+
+[sync]
+bucket = "chozo-migrations"
+path = "custom/state.json"
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    cfg = config.load_config()
+    assert cfg.sync.path == "custom/state.json"
+
+
+def test_sync_slug_prefers_registry_slug(tmp_path: Path) -> None:
+    cfg = config.ProjectConfig(
+        root=tmp_path, name="My App", migrations_dir=tmp_path / "migrations", slug="registered-slug"
+    )
+    assert cfg.sync_slug == "registered-slug"
+
+
+def test_sync_slug_slugifies_name(tmp_path: Path) -> None:
+    cfg = config.ProjectConfig(root=tmp_path, name="My  App!", migrations_dir=tmp_path / "migrations")
+    assert cfg.sync_slug == "my-app"

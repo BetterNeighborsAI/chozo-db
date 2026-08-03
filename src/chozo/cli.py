@@ -49,7 +49,7 @@ def _local_store(ctx: Ctx) -> FileHistoryStore:
 
 def _store(ctx: Ctx) -> HistoryStore:
     local = _local_store(ctx)
-    remote = sync.gcs_remote_from_env()
+    remote = sync.remote_from_config(ctx.cfg)
     if remote is None:
         return local
     return sync.SyncedHistoryStore(local, remote, warn=ctx.out.warning)
@@ -98,6 +98,11 @@ url_var = "DATABASE_URL_DEV"
 
 [envs.prod]
 url_var = "DATABASE_URL"
+
+# One shared bucket for every project; history stays isolated per project
+# at gs://<bucket>/<project-slug>/history.json (override with `path`).
+# [sync]
+# bucket = "chozo-migrations"
 '''
     )
     ctx.out.success(f"Initialized chozo project '{name}' at {root}")
@@ -128,6 +133,18 @@ def cmd_new(args: argparse.Namespace, ctx: Ctx) -> int:
     cfg.migrations_dir.mkdir(parents=True, exist_ok=True)
     num = discovery.next_number(cfg.migrations_dir)
     name = f"{num:03d}_{slug}"
+    if args.oneoff:
+        # One-way flat file for inserts / data fixes. Tracked by content hash,
+        # so it cannot silently re-run even if renamed.
+        path = cfg.migrations_dir / f"{name}.sql"
+        path.write_text(
+            f'-- one-off: {name}\n-- Purpose: [what and why]\n-- Rollback: [how to undo by hand, or "not reversible"]\n\n'
+        )
+        ctx.out.success(f"Created {name}.sql (one-off, no automatic rollback)")
+        ctx.out.note(str(path))
+        if args.json:
+            ctx.out.emit_json({"status": "created", "migration": f"{name}.sql", "kind": "oneoff", "up": str(path)})
+        return EXIT_OK
     mig_dir = cfg.migrations_dir / name
     mig_dir.mkdir(parents=True, exist_ok=True)
     (mig_dir / "up.sql").write_text(f"-- migration: {name} (up)\n-- describe the change here\n\n")
@@ -427,6 +444,113 @@ def cmd_run(args: argparse.Namespace, ctx: Ctx) -> int:
     )
 
 
+# --- exec: tracked one-off scripts (inserts, data fixes) ---
+
+
+def cmd_exec(args: argparse.Namespace, ctx: Ctx) -> int:
+    """Apply an arbitrary SQL file once, recorded in history with who/when/hash.
+
+    Unlike migrations, exec'd files live outside the migrations flow: they never
+    appear in `up`/`status`, but the history entry (with content hash) prevents
+    silently re-running the same script — even under a different file name.
+    """
+    file = Path(args.file).expanduser().resolve()
+    if not file.is_file():
+        ctx.out.error(f"no such file: {file}")
+        if args.json:
+            ctx.out.emit_json({"status": "failed", "error": f"no such file: {file}"})
+        return EXIT_FAIL
+
+    cfg = ctx.cfg
+    url = _env_url(ctx, args.env)
+    ctx.out.env_badge(args.env, cfg.envs.get(args.env, ""), config_target(url))
+
+    store = _store(ctx)
+    hist = history.load(store)
+    mig = Migration(name=file.name, number=0, dir=file.parent, up=file, down=None)
+    digest = integrity.content_hash(mig)
+
+    if not args.dry_run and not args.allow_rerun:
+        existing = hist.get(args.env, {}).get(mig.name)
+        if isinstance(existing, dict) and existing.get("applied_at"):
+            at = (existing.get("applied_at") or "")[:19].replace("T", " ")
+            by = existing.get("applied_by") or "?"
+            message = f"{mig.name} was already applied to {args.env} on {at} by {by}; pass --allow-rerun to force."
+            ctx.out.warning(message)
+            if args.json:
+                ctx.out.emit_json(
+                    {
+                        "status": "blocked",
+                        "env": args.env,
+                        "file": mig.name,
+                        "error": message,
+                        "applied_at": existing.get("applied_at"),
+                        "applied_by": existing.get("applied_by"),
+                    }
+                )
+            return EXIT_FAIL
+        dup = integrity.find_duplicate(digest, hist, args.env, mig.name)
+        if dup is not None:
+            message = (
+                f"identical content already applied as '{dup['name']}' on {dup['applied_at']}; "
+                "pass --allow-rerun to force."
+            )
+            ctx.out.warning(message)
+            if args.json:
+                ctx.out.emit_json({"status": "blocked", "env": args.env, "file": mig.name, "error": message})
+            return EXIT_FAIL
+
+    if not _prod_gate(args.env, args.dry_run, args.confirm_prod, ctx.out):
+        if args.json:
+            ctx.out.emit_json(
+                {"status": "failed", "env": args.env, "file": mig.name, "error": "prod requires --confirm-prod"}
+            )
+        return EXIT_FAIL
+
+    if not args.yes and not ctx.out.quiet and not args.dry_run:
+        ctx.out.sql_preview(file.read_text())
+        if not ctx.out.confirm(f"Execute {mig.name} against {args.env}?", default=False):
+            ctx.out.info("Aborted.")
+            return EXIT_FAIL
+
+    res = migrator.execute(url, mig, dry_run=args.dry_run)
+    if res.status == "applied":
+        if not args.dry_run:
+            history.record(
+                store, hist, args.env, mig.name, method="exec", duration_seconds=res.duration, content_hash=digest
+            )
+        ctx.out.success(f"Executed {mig.name}" + (f" [{res.duration:.2f}s]" if res.duration else ""))
+    elif res.status == "blocked":
+        ctx.out.warning(f"Blocked {mig.name}: {res.error}")
+    else:
+        if not args.dry_run:
+            history.record(
+                store,
+                hist,
+                args.env,
+                mig.name,
+                method="exec",
+                duration_seconds=res.duration,
+                success=False,
+                error=res.error,
+            )
+        ctx.out.error(f"Failed {mig.name}: {res.error}")
+
+    if args.json:
+        ctx.out.emit_json(
+            {
+                "status": "success" if res.status == "applied" else "failed",
+                "env": args.env,
+                "file": mig.name,
+                "result": res.status,
+                "dry_run": args.dry_run,
+                "elapsed_s": round(res.duration, 3) if res.duration else 0,
+                "error": res.error,
+            }
+        )
+    return EXIT_OK if res.status == "applied" else EXIT_FAIL
+
+
 # --- down / rollback ---
 
 
@@ -530,14 +654,26 @@ def cmd_status(args: argparse.Namespace, ctx: Ctx) -> int:
         and integrity.find_drift(by_name[name], integrity.content_hash(by_name[name]), hist, args.env)
     ]
     if args.json:
+        meta = hist.get("_meta", {})
         ctx.out.emit_json(
-            {"env": args.env, "applied": [n for n in names if n not in pending], "pending": pending, "drift": drift}
+            {
+                "env": args.env,
+                "applied": [n for n in names if n not in pending],
+                "pending": pending,
+                "drift": drift,
+                "last_synced_at": meta.get("last_synced_at"),
+                "last_synced_by": meta.get("last_synced_by"),
+            }
         )
         return EXIT_OK
     ctx.out.status_tree(args.env, names, applied, pending)
     for name in drift:
         ctx.out.warning(f"{name}: content changed since it was applied.")
     ctx.out.note(f"Total {len(names)}  Applied {len(names) - len(pending)}  Pending {len(pending)}")
+    meta = hist.get("_meta", {})
+    if meta.get("last_synced_at"):
+        sync_at = meta["last_synced_at"][:19].replace("T", " ")
+        ctx.out.note(f"GCS synced {sync_at} by {meta.get('last_synced_by', '?')}")
     return EXIT_OK
 
 
@@ -617,9 +753,9 @@ def cmd_inspect(args: argparse.Namespace, ctx: Ctx) -> int:
 
 
 def cmd_sync(args: argparse.Namespace, ctx: Ctx) -> int:
-    remote = sync.gcs_remote_from_env()
+    remote = sync.remote_from_config(ctx.cfg)
     if remote is None:
-        message = f"GCS sync is not configured; set {sync.GCS_BUCKET_ENV}."
+        message = f"GCS sync is not configured; set {sync.GCS_BUCKET_ENV} or add a [sync] section to chozo.toml."
         ctx.out.warning(message)
         if args.json:
             ctx.out.emit_json({"status": "not_configured", "error": message})
@@ -627,13 +763,15 @@ def cmd_sync(args: argparse.Namespace, ctx: Ctx) -> int:
     result = sync.synchronize(_local_store(ctx), remote)
     payload = {
         "status": "synced",
+        "remote": sync.remote_uri(remote),
         "remote_found": result.remote_found,
         "last_synced_at": result.history.get("_meta", {}).get("last_synced_at"),
+        "last_synced_by": result.history.get("_meta", {}).get("last_synced_by"),
     }
     if args.json:
         ctx.out.emit_json(payload)
     else:
-        ctx.out.success("Migration history synchronized with GCS.")
+        ctx.out.success(f"Migration history synchronized with {sync.remote_uri(remote)}")
     return EXIT_OK
 
 
@@ -719,6 +857,7 @@ def cmd_which(args: argparse.Namespace, ctx: Ctx) -> int:
         "migrations_dir": str(cfg.migrations_dir),
         "history_path": str(cfg.history_path),
         "envs": cfg.envs,
+        "sync": sync.remote_uri(remote) if (remote := sync.remote_from_config(cfg)) else None,
     }
     if args.json:
         ctx.out.emit_json(payload)
@@ -728,6 +867,9 @@ def cmd_which(args: argparse.Namespace, ctx: Ctx) -> int:
     ctx.out.note(f"Root: {cfg.root}")
     ctx.out.note(f"Migrations: {cfg.migrations_dir}")
     ctx.out.note(f"History: {cfg.history_path}")
+    remote = sync.remote_from_config(cfg)
+    if remote is not None:
+        ctx.out.note(f"Sync: {sync.remote_uri(remote)}")
     return EXIT_OK
 
 
@@ -760,6 +902,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("new", help="Create a new migration (UP + DOWN).")
     sp.add_argument("name", help="Snake_case migration name, e.g. add_users_table.")
+    sp.add_argument(
+        "--oneoff",
+        action="store_true",
+        help="Create a one-way flat file (insert / data fix) instead of an UP+DOWN directory.",
+    )
+    sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
+
+    sp = sub.add_parser("exec", help="Execute an arbitrary SQL file once, tracked in history (inserts, one-offs).")
+    sp.add_argument("file", help="Path to the SQL file to execute.")
+    _add_env(sp, required=True)
+    sp.add_argument("--dry-run", action="store_true", help="Execute then ROLLBACK; record nothing.")
+    sp.add_argument("--yes", "-y", action="store_true", help="No confirmation prompt.")
+    sp.add_argument("--confirm-prod", action="store_true", help="Consent flag required for --env prod.")
+    sp.add_argument(
+        "--allow-rerun",
+        action="store_true",
+        help="Allow re-running a script (or identical content) already applied.",
+    )
     sp.add_argument("--json", action="store_true", dest="json", help="Emit JSON to stdout.")
 
     sp = sub.add_parser("up", help="Apply pending migrations.")
@@ -860,6 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
 _HANDLERS = {
     "init": cmd_init,
     "new": cmd_new,
+    "exec": cmd_exec,
     "up": cmd_up,
     "down": cmd_down,
     "rollback": cmd_down,

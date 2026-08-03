@@ -25,7 +25,9 @@ Requires PostgreSQL. Connection strings come from environment variables (never s
 ```bash
 chozo init                          # create chozo.toml + migrations/
 chozo new add_users_table           # migrations/001_add_users_table/{up,down}.sql
+chozo new backfill_slugs --oneoff   # migrations/002_backfill_slugs.sql (one-way data fix)
 chozo up --env local                # apply pending migrations
+chozo exec ./scripts/fix.sql --env dev   # run an arbitrary script once, tracked in history
 chozo rollback --env local          # undo the last applied migration
 chozo status --env dev              # applied vs pending
 chozo inspect --env dev --json      # live schema as JSON (agents)
@@ -73,6 +75,21 @@ separate `_history.json`. With no `chozo.toml`, the migracli
 `sql/migrations/` layout is discovered automatically when walking up from the
 current directory.
 
+## One-offs and inserts
+
+Data fixes and insert scripts are first-class, tracked citizens:
+
+- `chozo new <name> --oneoff` scaffolds a one-way flat `NNN_<name>.sql` with a
+  `-- Rollback:` comment convention for documenting manual undo.
+- `chozo exec <file.sql> --env <env>` applies an arbitrary SQL file once. The
+  run is recorded in history with **who** (`applied_by` + per-event `by`),
+  **when** (`applied_at` + per-event `at`), duration, and a content hash.
+  Re-running the same script — or the same content under a different file name —
+  is blocked unless you pass `--allow-rerun`.
+
+Both paths go through the destructive-operation gate and the prod gate, and
+support `--dry-run` and `--json`.
+
 ## Configuration
 
 `chozo.toml` in the project root:
@@ -91,6 +108,21 @@ url_var = "DATABASE_URL"
 ```
 
 Without a `chozo.toml`, `chozo` falls back to `local`/`dev`/`prod` reading `DATABASE_URL_LOCAL`/`DATABASE_URL_DEV`/`DATABASE_URL`.
+
+### Shared history sync (`[sync]`)
+
+One shared GCS bucket holds every project's history, isolated per project:
+
+```toml
+[sync]
+bucket = "chozo-migrations"
+# path is optional — defaults to "<project-slug>/history.json"
+```
+
+With that, `pd-intelligence` syncs to `gs://chozo-migrations/pd-intelligence/history.json`
+and every other registered project gets its own path in the same bucket. The
+`GCS_MIGRATIONS_BUCKET`/`GCS_MIGRATIONS_PATH` env vars remain supported and
+override `chozo.toml` (migracli-compatible, handy in CI).
 
 ## Multi-project registry (`~/.chozo`)
 
@@ -127,20 +159,19 @@ Set `CHOZO_HOME` to relocate the registry (used by tests).
 
 ## Shared history sync
 
-Chozo retains migracli's optional GCS state synchronization. Install the extra
-and set the same environment variables:
+Chozo retains migracli's optional GCS state synchronization, configured via
+`[sync]` in `chozo.toml` (see above) or the same environment variables:
 
 ```bash
 uv tool install 'chozo-db[gcs]'
-export GCS_MIGRATIONS_BUCKET=my-bucket
-export GCS_MIGRATIONS_PATH=migrations/migration_history.json  # optional default
+export GCS_MIGRATIONS_BUCKET=chozo-migrations   # overrides chozo.toml
 chozo sync --json
 ```
 
 When configured, history is merged from GCS on load and pushed after local
-saves. A cloud outage never discards a successful local history write. For
-multiple registered projects, give each project a distinct
-`GCS_MIGRATIONS_PATH`.
+saves — automatically, on every command. A cloud outage never discards a
+successful local history write. `chozo status` shows when and by whom the
+history was last synced, and `chozo which` shows the resolved `gs://` target.
 
 ## Roadmap
 
@@ -148,6 +179,8 @@ multiple registered projects, give each project a distinct
 - [x] Migracli compatibility: flat SQL files / GCS sync / clone history mode
 - [x] `chozo inspect` — reflect live schema as JSON
 - [x] `~/.chozo` multi-project registry with per-project history + credential isolation
+- [x] One-offs & inserts: `chozo new --oneoff` + `chozo exec` with run-once content-hash tracking
+- [x] `[sync]` bucket config with per-project remote paths (`<slug>/history.json`)
 - [ ] `chozo analyze` / `chozo diff` — Alembic-style autogenerate from SQLAlchemy/SQLModel models
 
 ## Development
