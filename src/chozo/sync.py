@@ -15,10 +15,13 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from chozo import history
 from chozo.history import HistoryStore
+
+if TYPE_CHECKING:
+    from chozo.config import ProjectConfig
 
 GCS_BUCKET_ENV = "GCS_MIGRATIONS_BUCKET"
 GCS_PATH_ENV = "GCS_MIGRATIONS_PATH"
@@ -75,6 +78,26 @@ def gcs_remote_from_env() -> GCSHistoryRemote | None:
     if not bucket:
         return None
     return GCSHistoryRemote(bucket, os.environ.get(GCS_PATH_ENV, GCS_DEFAULT_PATH))
+
+
+def remote_from_config(cfg: ProjectConfig) -> GCSHistoryRemote | None:
+    """Resolve the remote history backend for a project.
+
+    Precedence: `GCS_MIGRATIONS_BUCKET`/`GCS_MIGRATIONS_PATH` env vars (migracli-
+    compatible, useful as CI overrides) win over `chozo.toml [sync]`. With only a
+    bucket configured, the path defaults to `<project-slug>/history.json` so one
+    shared bucket stays isolated per project.
+    """
+    env_remote = gcs_remote_from_env()
+    if env_remote is not None:
+        return env_remote
+    if not cfg.sync.bucket:
+        return None
+    return GCSHistoryRemote(cfg.sync.bucket, cfg.sync.path or f"{cfg.sync_slug}/history.json")
+
+
+def remote_uri(remote: GCSHistoryRemote) -> str:
+    return f"gs://{remote.bucket}/{remote.path}"
 
 
 def _stamp(value: dict) -> None:

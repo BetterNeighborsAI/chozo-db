@@ -11,6 +11,7 @@ back to the default `local`/`dev`/`prod` -> `DATABASE_URL_*` convention.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,15 +25,37 @@ except ModuleNotFoundError:  # pragma: no cover - py3.12+ always has tomllib
 
 
 @dataclass
+class SyncConfig:
+    """Remote history sync settings from `chozo.toml [sync]`.
+
+    `bucket` names one shared bucket for every project (e.g. "chozo-migrations").
+    `path` is optional; when omitted the remote path defaults to
+    `<project-slug>/history.json` so projects stay isolated inside the bucket.
+    """
+
+    bucket: str | None = None
+    path: str | None = None
+
+
+@dataclass
 class ProjectConfig:
     root: Path
     name: str
     migrations_dir: Path
     envs: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ENVS))
+    sync: SyncConfig = field(default_factory=SyncConfig)
     # Registry layer fields (None/False => plain local project, no registry).
     slug: str | None = None
     registered: bool = False
     history_override: Path | None = None
+
+    @property
+    def sync_slug(self) -> str:
+        """Slug used for the per-project remote path (registry slug wins)."""
+        if self.slug:
+            return self.slug
+        slug = re.sub(r"[^a-z0-9]+", "-", self.name.lower()).strip("-")
+        return re.sub(r"-{2,}", "-", slug) or "project"
 
     @property
     def history_path(self) -> Path:
@@ -68,6 +91,7 @@ def read_project(root: Path) -> ProjectConfig:
     root = root.expanduser().resolve()
     config_file = root / CONFIG_FILENAME
     envs = dict(DEFAULT_ENVS)
+    sync_cfg = SyncConfig()
     if config_file.is_file():
         data = tomllib.loads(config_file.read_text())
         project = data.get("project", {})
@@ -76,11 +100,13 @@ def read_project(root: Path) -> ProjectConfig:
         for env_name, env_cfg in data.get("envs", {}).items():
             if "url_var" in env_cfg:
                 envs[env_name] = env_cfg["url_var"]
+        sync_data = data.get("sync", {})
+        sync_cfg = SyncConfig(bucket=sync_data.get("bucket"), path=sync_data.get("path"))
     else:
         name = root.name
         legacy_dir = root / "sql" / "migrations"
         migrations_dir = (legacy_dir if legacy_dir.is_dir() else root / "migrations").resolve()
-    return ProjectConfig(root=root, name=name, migrations_dir=migrations_dir, envs=envs)
+    return ProjectConfig(root=root, name=name, migrations_dir=migrations_dir, envs=envs, sync=sync_cfg)
 
 
 def load_config(start: Path | None = None) -> ProjectConfig:
