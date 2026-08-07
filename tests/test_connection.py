@@ -22,3 +22,26 @@ def test_to_libpq_quotes_credentials_and_preserves_options() -> None:
     assert "password='p a\\'ss'" in conninfo
     assert "sslmode=require" in conninfo
     assert "connect_timeout=4" in conninfo
+
+
+def test_is_sqlite_detects_sqlite_schemes() -> None:
+    assert connection.is_sqlite("sqlite:///app.db")
+    assert connection.is_sqlite("sqlite:///:memory:")
+    assert connection.is_sqlite("sqlite:////abs/path/app.db")
+    assert connection.is_sqlite("sqlite+pysqlite:///app.db")
+
+
+def test_is_sqlite_false_for_postgres() -> None:
+    assert not connection.is_sqlite("postgresql://alice@db.example:5432/app")
+
+
+def test_is_sqlite_false_for_unparseable() -> None:
+    assert not connection.is_sqlite("not a url with secret")
+
+
+def test_format_target_sqlite_shows_path_without_credentials() -> None:
+    assert connection.format_target("sqlite:///app.db") == "sqlite:app.db"
+    assert connection.format_target("sqlite:///:memory:") == "sqlite::memory:"
+    target = connection.format_target("sqlite:////tmp/chozo/app.db")
+    assert target == "sqlite:/tmp/chozo/app.db"
+    assert "@" not in target

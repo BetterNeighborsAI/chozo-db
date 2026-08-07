@@ -883,7 +883,7 @@ def _add_env(sp: argparse.ArgumentParser, required: bool = False) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Agent-friendly PostgreSQL migrations + schema inspection.",
+        description="Agent-friendly PostgreSQL + SQLite migrations + schema inspection.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--json", action="store_true", dest="json_out", help="Emit JSON to stdout (agent mode).")

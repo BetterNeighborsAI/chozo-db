@@ -14,3 +14,5 @@ build/
 .ruff_cache/
 chozo.toml
 migrations/
+.worktree/
+.worktrees/

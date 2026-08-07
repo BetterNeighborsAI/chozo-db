@@ -1,8 +1,8 @@
 # chozo-db
 
-Agent-friendly PostgreSQL migrations + schema inspection CLI. Named after the Chozo of Metroid — the guardians of knowledge.
+Agent-friendly PostgreSQL + SQLite migrations + schema inspection CLI. Named after the Chozo of Metroid — the guardians of knowledge.
 
-`chozo-db` runs plain-SQL migrations against Postgres, tracks a per-project history with a full event trail, blocks destructive operations by default, and speaks JSON so AI agents and CI can drive it without a TTY. It generalizes a battle-tested in-house runner into an installable, cross-project tool.
+`chozo-db` runs plain-SQL migrations against Postgres **or** SQLite, tracks a per-project history with a full event trail, blocks destructive operations by default, and speaks JSON so AI agents and CI can drive it without a TTY. It generalizes a battle-tested in-house runner into an installable, cross-project tool. SQLite support (Python's stdlib, no server) makes it usable for local, serverless projects.
 
 ## Status
 
@@ -18,7 +18,7 @@ uv tool install chozo-db
 pipx install chozo-db
 ```
 
-Requires PostgreSQL. Connection strings come from environment variables (never stored in the repo).
+Requires PostgreSQL for the Postgres backend; SQLite needs nothing extra (Python's stdlib). Connection strings come from environment variables (never stored in the repo).
 
 ## Quick start
 
@@ -49,6 +49,24 @@ Exit codes: `0` success · `1` failure · `2` nothing to do.
 ## Destructive operations
 
 `chozo` parses migration SQL and refuses to auto-apply anything matching `DROP TABLE`, `TRUNCATE`, `DELETE FROM` (unqualified), `DROP DATABASE`, or `DROP SCHEMA`. Dry runs are always allowed (they `ROLLBACK`). To run a blocked migration you must apply it by hand — there is no `--force` for destructive ops on purpose.
+
+## SQLite: local, serverless projects
+
+`chozo` also speaks SQLite (Python's stdlib, so there's no server to run). Point any env at a file URL and the same `up` / `rollback` / `status` / `inspect` commands work unchanged — the runner wraps each migration in a single transaction on both backends, and `--dry-run` rolls back identically (a failed multi-statement migration rolls back atomically).
+
+```bash
+export DATABASE_URL_LOCAL=sqlite:///./dev.db      # relative path
+# or an absolute path (note the four slashes):
+export DATABASE_URL_LOCAL=sqlite:////abs/path/dev.db
+
+chozo up --env local --yes
+chozo inspect --env local --json
+```
+
+Notes:
+- Foreign keys are enforced (`PRAGMA foreign_keys = ON`), matching PostgreSQL semantics.
+- `:memory:` is **not** supported for the apply → inspect lifecycle: each command opens a fresh connection, and an in-memory DB dies with its connection. Use a file path instead.
+- Destructive detection (`DROP TABLE`, unqualified `DELETE FROM`, …) applies to SQLite too; `DROP DATABASE` / `DROP SCHEMA` simply never appear in SQLite.
 
 ## Migrations
 
@@ -179,6 +197,7 @@ history was last synced, and `chozo which` shows the resolved `gs://` target.
 - [x] Migracli compatibility: flat SQL files / GCS sync / clone history mode
 - [x] `chozo inspect` — reflect live schema as JSON
 - [x] `~/.chozo` multi-project registry with per-project history + credential isolation
+- [x] SQLite backend (stdlib `sqlite3`) for serverless local projects
 - [x] One-offs & inserts: `chozo new --oneoff` + `chozo exec` with run-once content-hash tracking
 - [x] `[sync]` bucket config with per-project remote paths (`<slug>/history.json`)
 - [ ] `chozo analyze` / `chozo diff` — Alembic-style autogenerate from SQLAlchemy/SQLModel models

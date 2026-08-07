@@ -1,4 +1,4 @@
-"""chozo-db — agent-friendly PostgreSQL migrations + schema inspection."""
+"""chozo-db — agent-friendly PostgreSQL + SQLite migrations + schema inspection."""
 
 __version__ = "0.1.0"
 
